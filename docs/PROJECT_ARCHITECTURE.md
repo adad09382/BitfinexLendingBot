@@ -7,51 +7,37 @@
 ## 2. 專案結構
 
 ```
-/funding_bot
-├── .env                      # 環境變數配置文件 (API Keys, DB, Bot Settings)
-├── .gitignore                # Git 忽略文件
-├── config.ini                # (已棄用) 配置文件，功能已移至 .env
-├── README.md                 # 專案說明、安裝與運行指南
-├── requirements.txt          # Python 依賴包列表
-├── .git/                     # Git 版本控制
-├── docs/                     # 專案文檔
-├── output/                   # (預留) 輸出文件目錄
+/BitfinexLendingBot
+├── .env                      # Environment variables (API keys, database, etc.)
+├── .gitignore                # Git ignore file
+├── README.md                 # Project overview and setup guide
+├── requirements.txt          # Python dependencies
+├── docs/
+│   ├── GEMINI_DEVELOPER_GUIDELINES.md # Guidelines for AI development
+│   ├── PROJECT_ARCHITECTURE.md # This file
+│   ├── COMMANDS.md           # Common commands
+│   ├── TOKEN_SYMBOLS.md      # Reference for funding token symbols
+│   └── archive/              # Old documentation
 ├── src/
 │   ├── main/
 │   │   ├── python/
-│   │   │   ├── main.py       # 機器人主程式入口
-│   │   │   ├── api/          # (預留) API 客戶端擴展
-│   │   │   ├── core/         # 核心邏輯與框架
-│   │   │   │   ├── config.py # 配置管理 (dataclasses & Pydantic)
-│   │   │   │   ├── exceptions.py # 自定義異常
-│   │   │   │   └── strategies/ # 借貸策略實現
-│   │   │   │       ├── base_strategy.py
-│   │   │   │       ├── laddering_strategy.py
-│   │   │   │       ├── adaptive_laddering_strategy.py
-│   │   │   │       ├── market_taker_strategy.py
-│   │   │   │       └── spread_filler_strategy.py
-│   │   │   ├── models/       # 數據模型 (Pydantic)
-│   │   │   │   ├── interest_payment.py
-│   │   │   │   ├── lending_order.py
-│   │   │   │   ├── market_log.py
-│   │   │   │   └── ...
-│   │   │   ├── repositories/ # 資料庫操作
-│   │   │   │   ├── interest_payment_repository.py
-│   │   │   │   └── market_log_repository.py
-│   │   │   ├── services/     # 服務層
-│   │   │   │   └── database_manager.py # 資料庫連接管理
-│   │   │   └── utils/        # (預留) 工具函數
+│   │   │   ├── main.py       # Main application entry point
+│   │   │   ├── api/          # (Reserved) API client extensions
+│   │   │   ├── core/         # Core logic and framework
+│   │   │   │   ├── config.py # Configuration management
+│   │   │   │   ├── exceptions.py # Custom exceptions
+│   │   │   │   └── strategies/ # Lending strategies
+│   │   │   ├── models/       # Pydantic data models
+│   │   │   ├── repositories/ # Database interaction layer
+│   │   │   └── services/     # Business logic services
 │   └── test/
-│       ├── integration/      # 集成測試
-│       │   └── test_funding_bid.py
-│       └── unit/             # 單元測試
-│           ├── test_config_manager.py
-│           └── test_profit_models.py
-├── tools/                    # 開發與維護工具
-│   ├── init_db.py            # 資料庫初始化腳本
-│   ├── run_all_tests.py      # 統一測試運行腳本
-│   └── ...
-└── venv/                     # Python 虛擬環境
+│       ├── integration/      # Integration tests
+│       └── unit/             # Unit tests
+├── tools/
+│   ├── init_db.py            # Database initialization script
+│   ├── run_all_tests.py      # Test runner script
+│   └── ...                   # Other utility scripts
+└── venv/                     # Python virtual environment
 ```
 
 ## 3. 核心組件與數據流
@@ -59,7 +45,7 @@
 ### 3.1 `main.py` - 機器人主程式
 
 `main.py` 是整個機器人的啟動和協調中心。其主要職責包括：
-1.  **加載配置:** 通過 `core.config.ConfigManager` 從 `.env` 文件安全地加載並驗證所有配置。
+1.  **加載配置:** 通過 `core.config.get_config_manager` 從 `.env` 文件安全地加載並驗證所有配置。
 2.  **初始化服務:** 創建 `bfxapi.Client` 用於 API 交互，並初始化 `services.database_manager.DatabaseManager` 來管理資料庫連接池。
 3.  **動態加載策略:** 根據 `.env` 中 `STRATEGY_NAME` 的配置，從 `core.strategies` 目錄動態導入並實例化對應的策略類。
 4.  **主執行循環:**
@@ -72,7 +58,7 @@
 
 ### 3.2 `core/config.py` - 配置管理器
 
-`ConfigManager` 使用 `dataclasses` 和 `decouple` 庫提供了一個類型安全、結構化的配置管理方案。它將 `.env` 中的變數解析為 `AppConfig` 對象，該對象包含了 `DatabaseConfig`, `ApiConfig`, `TradingConfig`, `StrategyConfig` 和 `LoggingConfig` 等多個子配置，使得配置在整個應用中傳遞和使用時清晰且不易出錯。
+`ConfigManager` 使用 `dataclasses` 和 `python-decouple` 庫提供了一個類型安全、結構化的配置管理方案。它將 `.env` 中的變數解析為 `AppConfig` 對象，該對象包含了 `DatabaseConfig`, `ApiConfig`, `TradingConfig`, `StrategyConfig` 和 `LoggingConfig` 等多個子配置，使得配置在整個應用中傳遞和使用時清晰且不易出錯。
 
 ### 3.3 `services/database_manager.py` - 資料庫管理器
 
@@ -81,6 +67,11 @@
 ### 3.4 `repositories/` - 資料庫倉庫
 
 倉庫層 (`repositories`) 負責將應用程式的數據模型 (`models`) 與資料庫進行交互。例如，`MarketLogRepository` 提供了將市場分析結果 (`MarketLog` 對象) 存儲到 `market_logs` 表的方法。這種分層將業務邏輯與數據持久化細節分離。
+
+目前的倉庫包括:
+*   `daily_profit_repository.py`
+*   `interest_payment_repository.py`
+*   `market_log_repository.py`
 
 ### 3.5 `core/strategies/` - 策略模式
 
