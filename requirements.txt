@@ -1,0 +1,4 @@
+bitfinex-api-py
+python-dotenv
+python-decouple
+psycopg2-binary
