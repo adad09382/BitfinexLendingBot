@@ -129,6 +129,28 @@ class MarketDataParsingError(MarketDataError):
     pass
 
 
+# Bitfinex 特定異常
+class BitfinexAPIError(ApiError):
+    """Bitfinex API 異常"""
+    pass
+
+
+class BitfinexAuthError(BitfinexAPIError):
+    """Bitfinex 認證異常"""
+    pass
+
+
+class BitfinexRateLimitError(BitfinexAPIError):
+    """Bitfinex 速率限制異常"""
+    pass
+
+
+# Daily Settlement 特定異常
+class SettlementError(FundingBotError):
+    """結算相關異常"""
+    pass
+
+
 # 異常工廠函數
 def create_insufficient_balance_error(available: float, required: float, currency: str) -> InsufficientBalanceError:
     """創建餘額不足異常"""

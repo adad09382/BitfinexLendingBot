@@ -1,4 +1,7 @@
 import logging
+from decimal import Decimal
+from typing import List, Dict, Any, Optional
+
 from .base_strategy import BaseStrategy
 
 log = logging.getLogger(__name__)
@@ -7,25 +10,37 @@ class SpreadFillerStrategy(BaseStrategy):
     """
     A strategy that places an offer within the bid-ask spread.
     """
-    def __init__(self, api_client, config, db_manager):
-        super().__init__(api_client, config, db_manager)
-        self.lending_duration = self.config('LENDING_DURATION_DAYS', cast=int)
-        self.spread_position_ratio = self.config('SF_SPREAD_POSITION_RATIO', cast=float, default=0.5)
-        self.min_spread_threshold = self.config('SF_MIN_SPREAD_THRESHOLD', cast=float, default=0.0001)
+    def __init__(self, config):
+        super().__init__(config)
+        self.lending_duration = config.trading.lending_duration_days
+        self.spread_position_ratio = config.strategy.sf_spread_position_ratio
+        self.min_spread_threshold = config.strategy.sf_min_spread_threshold
 
-    async def generate_offers(self, available_balance, market_data):
+    def generate_offers(self, available_balance: Decimal, market_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Generates an offer placed within the current bid-ask spread.
         """
         log.info("Executing Spread Filler Strategy.")
 
-        if not market_data or self.lending_duration not in market_data:
-            log.warning(f"Market data for the {self.lending_duration}-day period is not available.")
-            return []
-
-        market_period_data = market_data[self.lending_duration]
-        best_bid = market_period_data.get('bid')
-        best_ask = market_period_data.get('offer')
+        best_bid = None
+        if 'bids' in market_data and market_data['bids']:
+            for entry in market_data['bids']:
+                # entry format: [RATE, AMOUNT, PERIOD]
+                rate = Decimal(str(entry[0]))
+                period = int(entry[2])
+                if period == self.lending_duration:
+                    if best_bid is None or rate > best_bid:
+                        best_bid = rate
+        
+        best_ask = None
+        if 'asks' in market_data and market_data['asks']:
+            for entry in market_data['asks']:
+                # entry format: [RATE, AMOUNT, PERIOD]
+                rate = Decimal(str(entry[0]))
+                period = int(entry[2])
+                if period == self.lending_duration:
+                    if best_ask is None or rate < best_ask:
+                        best_ask = rate
 
         if best_bid is None or best_ask is None:
             log.warning(f"Best bid or ask rate is not available for the {self.lending_duration}-day period. Cannot place an offer.")
@@ -44,8 +59,8 @@ class SpreadFillerStrategy(BaseStrategy):
             log.warning(f"Calculated offer rate {offer_rate} is zero or negative. No offer will be placed.")
             return []
 
-        if available_balance < 150.0:
-            log.warning(f"Available balance ({available_balance:.2f}) is too low to place a minimum offer of 150.")
+        if available_balance < self.min_order_amount:
+            log.warning(f"Available balance ({available_balance:.2f}) is too low to place a minimum offer of {self.min_order_amount}.")
             return []
 
         offer = {
@@ -54,6 +69,6 @@ class SpreadFillerStrategy(BaseStrategy):
             'period': self.lending_duration
         }
         
-        log.info(f"Generated Spread Filler Offer: Amount={offer['amount']:.2f}, Rate={offer['rate']*100:.4f}%")
+        log.info(f"Generated Spread Filler Offer: Amount={offer['amount']:.2f}, Rate={offer['rate']*100:.4f}%, Period={offer['period']}")
 
         return [offer]
