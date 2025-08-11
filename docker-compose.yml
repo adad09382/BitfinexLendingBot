@@ -1,0 +1,189 @@
+version: '3.8'
+
+services:
+  # 主應用服務 - 成本優化的單體架構
+  bitfinex-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bitfinex-lending-bot
+    restart: unless-stopped
+    environment:
+      # 環境配置
+      - ENV=production
+      - LOG_LEVEL=INFO
+      
+      # 數據庫配置
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=bitfinex_bot
+      - DB_USER=bitfinex_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      
+      # API 配置 (從環境變量讀取)
+      - BITFINEX_API_KEY=${BITFINEX_API_KEY}
+      - BITFINEX_API_SECRET=${BITFINEX_API_SECRET}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      
+    volumes:
+      # 配置文件持久化
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      # 數據備份目錄
+      - ./backups:/app/backups
+      
+    depends_on:
+      postgres:
+        condition: service_healthy
+        
+    networks:
+      - bitfinex-network
+      
+    # 健康檢查
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # PostgreSQL 數據庫 - 成本優化配置
+  postgres:
+    image: postgres:13-alpine
+    container_name: bitfinex-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=bitfinex_bot
+      - POSTGRES_USER=bitfinex_user
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=en_US.UTF-8 --lc-ctype=en_US.UTF-8
+      
+    volumes:
+      # 數據持久化
+      - postgres_data:/var/lib/postgresql/data
+      # 初始化腳本
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./scripts/init_monitoring_db.sql:/docker-entrypoint-initdb.d/02-monitoring.sql:ro
+      # 備份腳本
+      - ./scripts/backup_db.sh:/usr/local/bin/backup_db.sh:ro
+      
+    ports:
+      # 僅在開發時暴露，生產環境移除此段
+      - "5432:5432"
+      
+    networks:
+      - bitfinex-network
+      
+    # 健康檢查
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bitfinex_user -d bitfinex_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      
+    # 性能優化配置
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.7
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+
+  # Redis 緩存 - 輕量級配置
+  redis:
+    image: redis:6-alpine
+    container_name: bitfinex-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      
+    volumes:
+      - redis_data:/data
+      
+    networks:
+      - bitfinex-network
+      
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # 監控服務 - 系統性能和告警
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bitfinex-monitor
+    restart: unless-stopped
+    command: ["python3", "/app/scripts/monitor.py"]
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=bitfinex_bot
+      - DB_USER=bitfinex_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - ALERT_THRESHOLDS_CPU=80
+      - ALERT_THRESHOLDS_MEMORY=80
+      - ALERT_THRESHOLDS_DISK=90
+      - MONITOR_INTERVAL=60
+    volumes:
+      - ./logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bitfinex-bot:
+        condition: service_healthy
+    networks:
+      - bitfinex-network
+    profiles:
+      - monitoring  # 使用 profile 使其可選
+
+  # Nginx 反向代理 - 可選（用於 API 訪問）
+  nginx:
+    image: nginx:alpine
+    container_name: bitfinex-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - bitfinex-bot
+    networks:
+      - bitfinex-network
+    profiles:
+      - web  # 使用 profile 使其可選
+
+# 網絡配置
+networks:
+  bitfinex-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# 數據持久化
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local

@@ -1,26 +1,30 @@
-import asyncio
 import time
 import logging
-import importlib
+import schedule # New import
 from decimal import Decimal
 from dotenv import load_dotenv
-from bfxapi import Client
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from src.main.python.core.config import get_config_manager, AppConfig
 from src.main.python.core.exceptions import (
     FundingBotError, ConfigurationError, StrategyLoadError, 
     InsufficientBalanceError, InvalidOrderError, create_strategy_load_error,
-    create_insufficient_balance_error, create_invalid_order_error, handle_api_errors
+    create_insufficient_balance_error, create_invalid_order_error
 )
 from src.main.python.services.database_manager import DatabaseManager
+from src.main.python.api.bitfinex_api_client import BitfinexApiClient
 from src.main.python.repositories.market_log_repository import MarketLogRepository
-from src.main.python.models.market_log import MarketLog
-from src.main.python.models.lending_order import LendingOrder, OrderStatus
-from src.main.python.models.interest_payment import InterestPayment
-
-import bfxapi
-from datetime import datetime
+from src.main.python.repositories.lending_order_repository import LendingOrderRepository
+from src.main.python.repositories.interest_payment_repository import InterestPaymentRepository
+from src.main.python.repositories.daily_earnings_repository import DailyEarningsRepository
+from src.main.python.services.market_data_service import MarketDataService
+from src.main.python.services.account_service import AccountService
+from src.main.python.services.funding_service import FundingService
+from src.main.python.services.daily_settlement_service import DailySettlementService
+from src.main.python.core.order_manager import OrderManager
+from src.main.python.core.strategy_executor import StrategyExecutor
+from src.main.python.core.risk_manager import RiskManager # New import
+from src.main.python.utils.notification_manager import NotificationManager
 
 log = logging.getLogger('FundingBot')
 
@@ -44,20 +48,41 @@ class FundingBot:
         
         # --- Initialize Services & Repositories ---
         try:
-            self.bfx = Client(
-                api_key=self.config.api.key, 
-                api_secret=self.config.api.secret
-            )
             self.db_manager = DatabaseManager(self.config.database)
+            self.api_client = BitfinexApiClient(self.config.api)
+
             self.market_log_repo = MarketLogRepository(self.db_manager)
-            
-            # --- Load Strategy ---
-            self.strategy = self._load_strategy()
+            self.lending_order_repo = LendingOrderRepository(self.db_manager)
+            self.interest_payment_repo = InterestPaymentRepository(self.db_manager)
+            self.daily_earnings_repo = DailyEarningsRepository(self.db_manager)
+
+            self.market_data_service = MarketDataService(self.api_client, self.market_log_repo)
+            self.account_service = AccountService(self.api_client)
+            self.funding_service = FundingService(self.api_client, self.config, self.lending_order_repo)
+            self.daily_settlement_service = DailySettlementService(
+                self.daily_earnings_repo, 
+                self.interest_payment_repo, 
+                self.api_client
+            )
+            self.order_manager = OrderManager(self.api_client, self.lending_order_repo, self.interest_payment_repo)
+            self.strategy_executor = StrategyExecutor(self.config)
+            self.notification_manager = NotificationManager(
+                telegram_bot_token=self.config.api.telegram_bot_token,
+                telegram_chat_id=self.config.api.telegram_chat_id
+            )
+            self.risk_manager = RiskManager(
+                config=self.config,
+                account_service=self.account_service,
+                funding_service=self.funding_service,
+                order_manager=self.order_manager,
+                notification_manager=self.notification_manager
+            )
             
             log.info("FundingBot initialized successfully")
             
         except Exception as e:
             log.error(f"Failed to initialize FundingBot: {e}")
+            self.notification_manager.send_alert(f"FundingBot initialization failed: {e}", level="CRITICAL")
             self._cleanup()
             raise
     
@@ -90,352 +115,184 @@ class FundingBot:
         if hasattr(self, 'db_manager') and self.db_manager:
             self.db_manager.close()
 
-    def _load_strategy(self):
-        """動態加載配置中指定的策略"""
-        strategy_name = self.config.strategy.strategy_name
-        log.info(f"Loading strategy: {strategy_name}")
-        
-        try:
-            module_path = f"src.main.python.core.strategies.{strategy_name}_strategy"
-            strategy_module = importlib.import_module(module_path)
-            class_name = f"{strategy_name.replace('_', ' ').title().replace(' ', '')}Strategy"
-            strategy_class = getattr(strategy_module, class_name)
-            
-            # 傳遞配置和服務到策略
-            return strategy_class(self.bfx, self.config, self.market_log_repo)
-            
-        except (ImportError, AttributeError) as e:
-            error = create_strategy_load_error(strategy_name, e)
-            log.error(f"Failed to load strategy: {error}")
-            raise error
-
-    @handle_api_errors
-    async def get_available_balance(self) -> Decimal:
-        """獲取資金錢包中的可用餘額"""
-        currency = self.config.trading.lending_currency
-        
-        try:
-            wallets = await asyncio.to_thread(self.bfx.rest.auth.get_wallets)
-            
-            for wallet in wallets:
-                if wallet.wallet_type == "funding" and wallet.currency == currency:
-                    balance = Decimal(str(wallet.available_balance))
-                    log.info(f"Available balance in funding wallet: {balance:.2f} {currency}")
-                    return balance
-            
-            log.warning(f"No funding wallet found for {currency}")
-            return Decimal('0.0')
-            
-        except Exception as e:
-            log.error(f"Failed to get available balance: {e}")
-            raise
-
-    @handle_api_errors
-    async def cancel_all_funding_offers(self):
-        """獲取並取消所有活躍的資金借貸訂單"""
-        currency = self.config.trading.lending_currency
-        symbol = f"f{currency}"
-        
-        try:
-            offers = await asyncio.to_thread(self.bfx.rest.auth.get_funding_offers, symbol=symbol)
-            
-            if not offers:
-                log.info(f"No active offers found for {symbol}")
-                return
-
-            log.info(f"Found {len(offers)} active offers for {symbol}. Cancelling them...")
-            
-            cancelled_count = 0
-            failed_count = 0
-            
-            for offer in offers:
-                try:
-                    await asyncio.to_thread(self.bfx.rest.auth.cancel_funding_offer, offer.id)
-                    log.info(f"Successfully cancelled offer ID: {offer.id}")
-                    cancelled_count += 1
-                except Exception as e:
-                    log.error(f"Failed to cancel offer ID: {offer.id}. Reason: {e}")
-                    failed_count += 1
-                    
-            log.info(f"Cancellation complete: {cancelled_count} successful, {failed_count} failed")
-            
-        except Exception as e:
-            log.error(f"Error fetching or cancelling funding offers: {e}")
-            raise
-
-    @handle_api_errors
-    async def place_funding_offer(self, rate: Decimal, amount: Decimal, period: int, 
-                                strategy_name: Optional[str] = None, 
-                                strategy_params: Optional[dict] = None):
-        """下達單個資金借貸訂單並記錄到資料庫"""
-        currency = self.config.trading.lending_currency
-        symbol = f"f{currency}"
-        min_amount = self.config.trading.min_order_amount
-        
-        # 驗證訂單參數
-        if amount < min_amount:
-            raise create_invalid_order_error(float(amount), float(min_amount), currency)
-        
-        if rate <= 0:
-            raise InvalidOrderError(f"Invalid rate: {rate}")
-        
-        if period <= 0:
-            raise InvalidOrderError(f"Invalid period: {period}")
-        
-        try:
-            log.info(f"Placing offer: {amount:.2f} {currency} at daily rate of {rate*100:.4f}% for {period} days")
-            
-            # 提交訂單到 Bitfinex
-            response = await asyncio.to_thread(
-                self.bfx.rest.auth.submit_funding_offer,
-                type="LIMIT",
-                symbol=symbol,
-                amount=float(amount),
-                rate=float(rate),
-                period=period
-            )
-            
-            log.info("Offer placed successfully")
-            
-            # 創建 LendingOrder 記錄
-            await self._create_lending_order_record(
-                response, symbol, amount, rate, period, strategy_name, strategy_params
-            )
-            
-        except Exception as e:
-            log.error(f"Error placing funding offer: {e}")
-            raise
-    
-    async def _create_lending_order_record(self, api_response, symbol: str, amount: Decimal, 
-                                         rate: Decimal, period: int, strategy_name: Optional[str], 
-                                         strategy_params: Optional[dict]):
-        """創建 LendingOrder 資料庫記錄"""
-        try:
-            # 從 API 響應中提取訂單 ID
-            # 注意：Bitfinex API 響應格式可能需要根據實際情況調整
-            order_id = None
-            if hasattr(api_response, 'id'):
-                order_id = api_response.id
-            elif isinstance(api_response, dict) and 'id' in api_response:
-                order_id = api_response['id']
-            elif isinstance(api_response, list) and len(api_response) > 0:
-                order_id = api_response[0]  # 有時 API 返回數組格式
-            
-            if not order_id:
-                log.warning("Unable to extract order ID from API response, generating temporary ID")
-                order_id = int(datetime.now().timestamp() * 1000000)  # 臨時 ID
-            
-            # 創建 LendingOrder 實例
-            lending_order = LendingOrder(
-                order_id=order_id,
-                symbol=symbol,
-                amount=amount,
-                rate=rate,
-                period=period,
-                status=OrderStatus.PENDING,
-                strategy_name=strategy_name,
-                strategy_params=strategy_params
-            )
-            
-            # 保存到資料庫（暫時記錄日誌，等 Repository 層實現）
-            log.info(f"Created LendingOrder record: ID={order_id}, Amount={amount}, Rate={rate*100:.4f}%")
-            
-            # TODO: 實際保存到資料庫
-            # await self.lending_order_repository.save(lending_order)
-            
-        except Exception as e:
-            log.error(f"Error creating LendingOrder record: {e}")
-            # 不拋出異常，避免影響主要的下單流程
-    
-    async def sync_order_status(self):
-        """同步活躍訂單的狀態"""
-        try:
-            log.info("Syncing order status from Bitfinex...")
-            
-            # 獲取當前活躍的資金訂單
-            symbol = f"f{self.config.trading.lending_currency}"
-            offers = await asyncio.to_thread(self.bfx.rest.auth.get_funding_offers, symbol=symbol)
-            
-            log.info(f"Found {len(offers)} active funding offers")
-            
-            # TODO: 實現與資料庫中 LendingOrder 記錄的同步
-            # 1. 從資料庫獲取狀態為 PENDING/ACTIVE 的訂單
-            # 2. 比對 API 返回的活躍訂單
-            # 3. 更新訂單狀態、執行金額等信息
-            # 4. 標記不再活躍的訂單為已完成
-            
-            for offer in offers:
-                log.info(f"Active offer: ID={offer.id}, Amount={offer.amount}, Rate={offer.rate*100:.4f}%")
-            
-        except Exception as e:
-            log.error(f"Error syncing order status: {e}")
-    
-    async def sync_interest_payments(self):
-        """同步利息支付記錄"""
-        try:
-            log.info("Syncing interest payments from Bitfinex ledger...")
-            
-            currency = self.config.trading.lending_currency
-            
-            # 獲取最近的 ledger 記錄
-            ledgers = await asyncio.to_thread(
-                self.bfx.rest.auth.get_ledgers,
-                currency=currency,
-                limit=250  # 增加獲取數量以確保覆蓋
-            )
-            
-            # 過濾出資金相關的收益記錄
-            funding_payments = [
-                ledger for ledger in ledgers 
-                if hasattr(ledger, 'description') and ledger.description and 
-                any(keyword in ledger.description.lower() for keyword in ['funding', 'interest', 'lending'])
-            ]
-            
-            log.info(f"Found {len(funding_payments)} potential interest payment records from API.")
-            
-            saved_count = 0
-            skipped_count = 0
-            
-            for ledger in funding_payments:
-                try:
-                    interest_payment = InterestPayment.from_ledger_entry({
-                        'id': ledger.id,
-                        'currency': ledger.currency,
-                        'amount': ledger.amount,
-                        'mts': ledger.mts,
-                        'description': ledger.description
-                    })
-                    
-                    # 保存到資料庫，如果不存在
-                    if self.interest_payment_repo.save_if_not_exists(interest_payment):
-                        saved_count += 1
-                    else:
-                        skipped_count += 1
-                        
-                except Exception as e:
-                    log.warning(f"Error processing ledger entry {ledger.id}: {e}")
-            
-            log.info(f"Interest sync complete. Saved: {saved_count}, Skipped (already exist): {skipped_count}")
-            
-        except Exception as e:
-            log.error(f"Error syncing interest payments: {e}")
-    
-    async def generate_basic_profit_report(self):
-        """生成基本的收益報告"""
-        try:
-            log.info("Generating basic profit report...")
-            
-            # TODO: 實現基本收益報告
-            # 1. 統計所有 LendingOrder 的預期收益
-            # 2. 統計所有 InterestPayment 的實際收益
-            # 3. 計算差異和收益率
-            # 4. 輸出報告到日誌
-            
-            log.info("=== 收益報告 ===")
-            log.info("預期收益: 待實現")
-            log.info("實際收益: 待實現") 
-            log.info("收益差異: 待實現")
-            log.info("平均收益率: 待實現")
-            log.info("===============")
-            
-        except Exception as e:
-            log.error(f"Error generating profit report: {e}")
-
-    async def run(self):
-        """機器人主運行循環"""
+    def run(self):
+        """
+        機器人主運行循環，使用 schedule 庫進行任務調度。
+        """
         log.info("FundingBot is running")
         
-        trading_config = self.config.trading
-        min_balance = trading_config.min_order_amount
-        currency = trading_config.lending_currency
-        interval = trading_config.check_interval_seconds
+        # 定義調度任務
+        schedule.every(self.config.trading.check_interval_seconds).seconds.do(self._run_cycle)
         
+        # 每日結算任務 (每天 00:05 執行)
+        schedule.every().day.at("00:05").do(self._run_daily_settlement)
+
+        # 首次運行
+        self._run_cycle()
+
         while True:
-            cycle_start_time = time.time()
-            
-            try:
-                log.info(f"\n{'='*50}\nStarting new cycle at {time.ctime()}\n{'='*50}")
-                
-                # 1. 取消現有訂單
-                await self.cancel_all_funding_offers()
-                await asyncio.sleep(5)  # 給 API 一些時間處理取消操作
-                
-                # 2. 獲取可用餘額
-                available_balance = await self.get_available_balance()
-                
-                # 3. 獲取市場數據
-                market_data = await self.strategy.analyze_and_log_market()
-                
-                # 4. 檢查餘額是否足夠
-                if available_balance < min_balance:
-                    raise create_insufficient_balance_error(
-                        float(available_balance), 
-                        float(min_balance), 
-                        currency
-                    )
-                
-                # 5. 生成訂單
-                offers_to_place = await self.strategy.generate_offers(available_balance, market_data)
-                
-                if offers_to_place:
-                    log.info(f"Strategy generated {len(offers_to_place)} offer(s) to place")
-                    
-                                    # 6. 下達訂單
+            schedule.run_pending()
+            time.sleep(1)
+
+    def _run_cycle(self):
+        """
+        機器人單次運行週期。
+        """
+        cycle_start_time = time.time()
+        lending_currency = self.config.trading.lending_currency
+        min_order_amount = self.config.trading.min_order_amount
+
+        log.info(f"
+{'='*50}
+Starting new cycle at {time.ctime()}
+{'='*50}")
+
+        try:
+            # 0. 風險評估
+            if not self.risk_manager.assess_and_manage_risk():
+                log.warning("Risk assessment failed or indicated high risk. Skipping offer placement this cycle.")
+                return
+
+            # 1. 取消所有活躍訂單
+            self.funding_service.cancel_all_funding_offers()
+            time.sleep(2) # 給 API 一些時間處理取消操作
+
+            # 2. 同步訂單狀態和處理利息支付
+            self.order_manager.sync_order_statuses(lending_currency)
+            self.order_manager.process_interest_payments(lending_currency)
+
+            # 3. 獲取可用餘額
+            available_balance = self.account_service.get_funding_balance(lending_currency)
+            log.info(f"Available funding balance: {available_balance:.2f} {lending_currency}")
+
+            # 4. 獲取市場數據
+            market_data = self.market_data_service.fetch_and_store_funding_book(f'f{lending_currency}')
+            if not market_data:
+                log.warning("No market data available. Skipping offer generation this cycle.")
+                return
+
+            # 5. 檢查餘額是否足夠
+            if available_balance < min_order_amount:
+                raise create_insufficient_balance_error(
+                    float(available_balance),
+                    float(min_order_amount),
+                    lending_currency
+                )
+
+            # 6. 生成訂單
+            offers_to_place = self.strategy_executor.execute_strategy(available_balance, market_data.rates_data)
+
+            if offers_to_place:
+                log.info(f"Strategy generated {len(offers_to_place)} offer(s) to place")
+
+                # 7. 下達訂單
                 successful_orders = 0
-                strategy_name = self.strategy.get_strategy_name()
-                strategy_info = self.strategy.get_strategy_info()
-                
+                strategy_name = self.strategy_executor.get_active_strategy_name()
+                # strategy_params 可以在策略內部獲取，或者從 config 中傳遞
+                strategy_params = self.config.strategy.__dict__ # 傳遞所有策略配置
+
                 for i, offer in enumerate(offers_to_place):
                     try:
-                        await self.place_funding_offer(
-                            Decimal(str(offer['rate'])), 
-                            Decimal(str(offer['amount'])), 
+                        self.funding_service.place_funding_offer(
+                            offer['rate'],
+                            offer['amount'],
                             offer['period'],
                             strategy_name=strategy_name,
-                            strategy_params=strategy_info
+                            strategy_params=strategy_params
                         )
                         successful_orders += 1
-                        
+
                         # 避免 API 速率限制
                         if i < len(offers_to_place) - 1:
-                            await asyncio.sleep(1)
-                            
+                            time.sleep(1)
+
                     except Exception as e:
                         log.error(f"Failed to place offer {i+1}: {e}")
-                    
-                    log.info(f"Order placement complete: {successful_orders}/{len(offers_to_place)} successful")
-                else:
-                    log.info("Strategy did not generate any offers in this cycle")
 
-            except InsufficientBalanceError as e:
-                log.warning(f"Insufficient balance: {e.message}")
-                log.info("Skipping offer placement this cycle")
-                
-            except FundingBotError as e:
-                log.error(f"Bot error in main loop: {e.message}")
-                if e.details:
-                    log.debug(f"Error details: {e.details}")
-                
-            except Exception as e:
-                log.error(f"Unexpected error in main loop: {e}", exc_info=True)
+                log.info(f"Order placement complete: {successful_orders}/{len(offers_to_place)} successful")
+            else:
+                log.info("Strategy did not generate any offers in this cycle")
 
-            finally:
-                # 計算週期時間
-                cycle_time = time.time() - cycle_start_time
-                log.info(f"Cycle completed in {cycle_time:.2f} seconds")
-                log.info(f"Sleeping for {interval} seconds until next cycle")
-                await asyncio.sleep(interval)
-    
+        except InsufficientBalanceError as e:
+            log.warning(f"Insufficient balance: {e.message}")
+            self.notification_manager.send_alert(f"Insufficient balance: {e.message}", level="WARNING")
+            log.info("Skipping offer placement this cycle")
+
+        except FundingBotError as e:
+            log.error(f"Bot error in main loop: {e.message}")
+            self.notification_manager.send_alert(f"Bot error: {e.message}", level="ERROR")
+            if e.details:
+                log.debug(f"Error details: {e.details}")
+
+        except Exception as e:
+            log.error(f"Unexpected error in main loop: {e}", exc_info=True)
+            self.notification_manager.send_alert(f"Unexpected error in main loop: {e}", level="CRITICAL")
+
+        finally:
+            # 計算週期時間
+            cycle_time = time.time() - cycle_start_time
+            log.info(f"Cycle completed in {cycle_time:.2f} seconds")
+            log.info(f"Next cycle in {self.config.trading.check_interval_seconds} seconds")
+            
+    def _run_daily_settlement(self):
+        """執行每日結算任務"""
+        try:
+            import asyncio
+            from datetime import date, timedelta
+            
+            # 結算前一天的數據
+            settlement_date = date.today() - timedelta(days=1)
+            currency = self.config.trading.lending_currency
+            
+            log.info(f"開始每日結算: {settlement_date} {currency}")
+            
+            # 在同步環境中運行異步任務
+            result = asyncio.run(
+                self.daily_settlement_service.perform_daily_settlement(settlement_date, currency)
+            )
+            
+            if result.success:
+                log.info(f"每日結算成功: {settlement_date} {currency}")
+                log.info(f"總收益: {result.daily_earnings.total_interest} {currency}")
+                log.info(f"年化收益率: {result.daily_earnings.annualized_return:.2f}%")
+                
+                # 發送成功通知
+                self.notification_manager.send_alert(
+                    f"📊 每日結算完成\n"
+                    f"日期: {settlement_date}\n"
+                    f"收益: {result.daily_earnings.total_interest} {currency}\n"
+                    f"年化收益率: {result.daily_earnings.annualized_return:.2f}%\n"
+                    f"資金利用率: {result.daily_earnings.utilization_rate:.2f}%",
+                    level="INFO"
+                )
+            else:
+                log.error(f"每日結算失敗: {result.error_message}")
+                self.notification_manager.send_alert(
+                    f"❌ 每日結算失敗\n"
+                    f"日期: {settlement_date}\n"
+                    f"錯誤: {result.error_message}",
+                    level="ERROR"
+                )
+                
+        except Exception as e:
+            log.error(f"每日結算異常: {e}", exc_info=True)
+            self.notification_manager.send_alert(
+                f"❌ 每日結算異常: {e}",
+                level="CRITICAL"
+            )
+
     def __enter__(self):
         """上下文管理器入口"""
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """上下文管理器出口"""
         self._cleanup()
 
-async def main():
-    """主函數"""
+def main():
+    """
+    主函數，負責初始化和運行機器人。
+    """
     config_manager = None
     bot = None
     
@@ -461,23 +318,31 @@ async def main():
         
         # 初始化並運行機器人
         with FundingBot(app_config) as bot:
-            await bot.run()
+            bot.run()
             
     except ConfigurationError as e:
         log.critical(f"Configuration error: {e.message}")
+        if bot and bot.notification_manager:
+            bot.notification_manager.send_alert(f"Configuration error: {e.message}", level="CRITICAL")
         if e.details:
             log.debug(f"Configuration details: {e.details}")
         
     except FundingBotError as e:
         log.critical(f"Bot error: {e.message}")
+        if bot and bot.notification_manager:
+            bot.notification_manager.send_alert(f"Bot error: {e.message}", level="CRITICAL")
         if e.details:
             log.debug(f"Error details: {e.details}")
         
     except KeyboardInterrupt:
         log.info("Received interrupt signal, shutting down gracefully...")
+        if bot and bot.notification_manager:
+            bot.notification_manager.send_alert("FundingBot received interrupt signal, shutting down.", level="INFO")
         
     except Exception as e:
         log.critical(f"Critical error occurred: {e}", exc_info=True)
+        if bot and bot.notification_manager:
+            bot.notification_manager.send_alert(f"Critical error occurred: {e}", level="CRITICAL")
         
     finally:
         # 清理資源
@@ -497,4 +362,4 @@ if __name__ == "__main__":
     load_dotenv(dotenv_path=os.path.join(project_root, '.env'), override=True)
     
     # 運行主程序
-    asyncio.run(main())
+    main()

@@ -28,6 +28,8 @@ class ApiConfig:
     """API 配置"""
     key: str
     secret: str
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
     
     def __post_init__(self):
         if not self.key or not self.secret:
@@ -173,7 +175,9 @@ class ConfigManager:
         """加載 API 配置"""
         return ApiConfig(
             key=self._raw_config('API_KEY'),
-            secret=self._raw_config('API_SECRET')
+            secret=self._raw_config('API_SECRET'),
+            telegram_bot_token=self._raw_config('TELEGRAM_BOT_TOKEN', default=None),
+            telegram_chat_id=self._raw_config('TELEGRAM_CHAT_ID', default=None)
         )
     
     def _load_trading_config(self) -> TradingConfig:

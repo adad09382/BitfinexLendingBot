@@ -1,4 +1,7 @@
 import logging
+from decimal import Decimal
+from typing import List, Dict, Any, Optional
+
 from .base_strategy import BaseStrategy
 
 log = logging.getLogger(__name__)
@@ -7,31 +10,44 @@ class LadderingStrategy(BaseStrategy):
     """
     A strategy that places multiple funding offers at different rates, creating a ladder.
     """
-    def __init__(self, api_client, config, db_manager):
-        super().__init__(api_client, config, db_manager)
+    def __init__(self, config):
+        super().__init__(config)
         # Load strategy-specific parameters from config
-        self.num_ladders = self.config('LADDERING_LADDERS', cast=int)
-        self.rate_spread = self.config('LADDERING_RATE_SPREAD', cast=float)
-        self.lending_duration = self.config('LENDING_DURATION_DAYS', cast=int)
+        self.num_ladders = config.strategy.laddering_ladders
+        self.rate_spread = config.strategy.laddering_rate_spread
+        self.lending_duration = config.trading.lending_duration_days
 
-    async def generate_offers(self, available_balance, market_data):
+    def generate_offers(self, available_balance: Decimal, market_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Generates a list of laddered funding offers based on provided market data.
         """
         log.info(f"Executing Laddering Strategy with {self.num_ladders} ladders.")
 
-        if not market_data or self.lending_duration not in market_data or market_data[self.lending_duration]['bid'] is None:
+        # Extract the best bid rate for the lending duration from the raw funding book data
+        best_bid_rate = None
+        if 'bids' in market_data and market_data['bids']:
+            for entry in market_data['bids']:
+                # entry format: [RATE, AMOUNT, PERIOD]
+                rate = Decimal(str(entry[0]))
+                amount = Decimal(str(entry[1]))
+                period = int(entry[2])
+                
+                if period == self.lending_duration:
+                    if best_bid_rate is None or rate > best_bid_rate:
+                        best_bid_rate = rate
+        
+        if best_bid_rate is None:
             log.error(f"No bid rate available for the {self.lending_duration}-day period. Aborting offer generation.")
             return []
 
-        base_rate = market_data[self.lending_duration]['bid']
+        base_rate = best_bid_rate
         log.info(f"Using base rate of {base_rate * 100:.4f}% for {self.lending_duration}-day period.")
 
         # Ensure the amount per offer is at least the Bitfinex minimum of 150
         amount_per_ladder = available_balance / self.num_ladders
-        if amount_per_ladder < 150.0:
-            log.warning(f"Calculated amount per ladder ({amount_per_ladder:.2f}) is below the 150 minimum. Adjusting number of ladders.")
-            self.num_ladders = int(available_balance // 150)
+        if amount_per_ladder < self.min_order_amount:
+            log.warning(f"Calculated amount per ladder ({amount_per_ladder:.2f}) is below the {self.min_order_amount} minimum. Adjusting number of ladders.")
+            self.num_ladders = int(available_balance // self.min_order_amount)
             if self.num_ladders == 0:
                 log.error("Available balance is too low to place even one offer.")
                 return []
@@ -53,6 +69,6 @@ class LadderingStrategy(BaseStrategy):
                 'period': self.lending_duration
             }
             offers.append(offer)
-            log.info(f"Generated ladder {i+1}/{self.num_ladders}: Amount={offer['amount']:.2f}, Rate={offer['rate']*100:.4f}%")
+            log.info(f"Generated ladder {i+1}/{self.num_ladders}: Amount={offer['amount']:.2f}, Rate={offer['rate']*100:.4f}%, Period={offer['period']}")
 
         return offers

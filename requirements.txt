@@ -2,3 +2,9 @@ bitfinex-api-py
 python-dotenv
 python-decouple
 psycopg2-binary
+pydantic
+pytest
+pytest-cov
+pytest-asyncio
+schedule
+numpy
