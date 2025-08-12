@@ -1,10 +1,13 @@
-bitfinex-api-py
-python-dotenv
-python-decouple
-psycopg2-binary
-pydantic
-pytest
-pytest-cov
-pytest-asyncio
-schedule
-numpy
+# SimpleLendingBot 精簡版依賴 - 只保留核心功能
+
+# HTTP 請求和 API 調用
+requests==2.31.0
+
+# PostgreSQL 數據庫連接
+psycopg2-binary==2.9.7
+
+# 環境變量配置管理
+python-decouple==3.8
+
+# 任務調度系統
+schedule==1.2.0

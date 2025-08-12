@@ -1,67 +1,52 @@
-# 多階段構建 - 成本優化的 Python 映像
-FROM python:3.9-slim as base
+# SimpleLendingBot 精簡版 Dockerfile
+# 單容器部署，專為 Railway 雲端優化
+
+FROM python:3.11-slim
+
+# 設置標籤信息
+LABEL maintainer="BitfinexLendingBot Team"
+LABEL version="1.0.0"
+LABEL description="SimpleLendingBot - 極簡版放貸機器人"
 
 # 設置工作目錄
 WORKDIR /app
 
 # 設置環境變量
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONHASHSEED=random \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
 # 安裝系統依賴 (最小化)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     gcc \
-    libc6-dev \
     libpq-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# 構建階段
-FROM base as builder
-
-# 複製依賴文件
+# 複製依賴文件並安裝 Python 包
 COPY requirements.txt .
-
-# 安裝 Python 依賴
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-# 生產階段
-FROM base as production
-
-# 創建非 root 用戶
-RUN groupadd -r bitfinex && useradd -r -g bitfinex bitfinex
-
-# 複製安裝的包
-COPY --from=builder /root/.local /home/bitfinex/.local
-
-# 確保腳本在 PATH 中
-ENV PATH=/home/bitfinex/.local/bin:$PATH
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # 複製應用代碼
-COPY src/ /app/src/
-COPY scripts/ /app/scripts/
-COPY config/ /app/config/
+COPY main.py .
+COPY schema.sql .
+COPY .env.example .
 
-# 創建必要的目錄
-RUN mkdir -p /app/logs /app/backups /app/data && \
-    chown -R bitfinex:bitfinex /app
+# 創建非 root 用戶 (安全最佳實踐)
+RUN useradd -m -u 1000 botuser && \
+    chown -R botuser:botuser /app
 
 # 切換到非 root 用戶
-USER bitfinex
+USER botuser
 
-# 健康檢查腳本
-COPY --chown=bitfinex:bitfinex scripts/health_check.py /app/health_check.py
-RUN chmod +x /app/health_check.py
+# 健康檢查 (Railway 需要)
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8080}/health || exit 1
 
-# 暴露端口 (用於健康檢查)
-EXPOSE 8000
-
-# 設置健康檢查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD python3 /app/health_check.py
+# 暴露端口 (Railway 動態分配)
+EXPOSE ${PORT:-8080}
 
 # 啟動命令
-CMD ["python3", "-m", "src.main.python.main"]
+CMD ["python", "main.py"]
