@@ -24,13 +24,17 @@ import time
 import logging
 import schedule
 import requests
-import psycopg2
+import psycopg
 import hmac
 import hashlib
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from decouple import config
 from typing import Dict, List, Optional
+
+# 簡化模塊：API + 階梯策略 (策略內部封裝市場數據)
+from bitfinex_api import BitfinexAPI
+from simple_ladder_strategy import SimpleLadderStrategy
 
 # 配置日誌系統
 logging.basicConfig(
@@ -41,183 +45,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-class SimpleBitfinexAPI:
-    """精簡版 Bitfinex API 客戶端 - 只包含核心功能"""
-    
-    def __init__(self):
-        self.api_key = config('BITFINEX_API_KEY')
-        self.api_secret = config('BITFINEX_API_SECRET')
-        self.base_url = 'https://api.bitfinex.com'
-        self.session = requests.Session()
-        self.session.headers.update({
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        })
-        
-        # 驗證 API 配置
-        if not self.api_key or not self.api_secret:
-            raise ValueError("Bitfinex API 密鑰未配置，請檢查 .env 文件")
-            
-        logger.info("Bitfinex API 客戶端初始化完成")
-    
-    def _generate_auth_headers(self, path: str, body: str = '') -> Dict[str, str]:
-        """生成 Bitfinex API 認證頭"""
-        nonce = str(int(time.time() * 1000))
-        signature_payload = f'/api/{path}{nonce}{body}'
-        
-        signature = hmac.new(
-            self.api_secret.encode('utf-8'),
-            signature_payload.encode('utf-8'),
-            hashlib.sha384
-        ).hexdigest()
-        
-        return {
-            'bfx-nonce': nonce,
-            'bfx-apikey': self.api_key,
-            'bfx-signature': signature
-        }
-    
-    def _make_request(self, method: str, endpoint: str, params: Dict = None, authenticated: bool = False) -> Optional[Dict]:
-        """執行 API 請求"""
-        url = f"{self.base_url}{endpoint}"
-        headers = {}
-        
-        try:
-            if authenticated:
-                body = ''
-                if method == 'POST' and params:
-                    body = str(params)
-                headers.update(self._generate_auth_headers(endpoint.replace('/v2', ''), body))
-            
-            if method == 'GET':
-                response = self.session.get(url, params=params, headers=headers, timeout=30)
-            elif method == 'POST':
-                response = self.session.post(url, json=params, headers=headers, timeout=30)
-            else:
-                raise ValueError(f"不支持的請求方法: {method}")
-            
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API 請求失敗 {method} {url}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"API 請求錯誤: {e}")
-            return None
-    
-    def get_wallet_balances(self) -> Dict[str, Decimal]:
-        """獲取錢包餘額"""
-        try:
-            response = self._make_request('POST', '/v2/auth/r/wallets', authenticated=True)
-            if not response:
-                return {}
-            
-            balances = {}
-            for wallet in response:
-                if len(wallet) >= 3:
-                    wallet_type, currency, balance = wallet[0], wallet[1], wallet[2]
-                    if wallet_type == 'funding':  # 只關心 funding 錢包
-                        balances[currency] = Decimal(str(balance))
-            
-            logger.info(f"獲取錢包餘額成功: {dict(balances)}")
-            return balances
-            
-        except Exception as e:
-            logger.error(f"獲取錢包餘額失敗: {e}")
-            return {}
-    
-    def get_active_funding_offers(self, currency: str) -> List[Dict]:
-        """獲取活躍的放貸訂單"""
-        try:
-            response = self._make_request('POST', f'/v2/auth/r/funding/offers/{currency}', authenticated=True)
-            if not response:
-                return []
-            
-            logger.info(f"獲取活躍訂單成功: {len(response)} 筆")
-            return response
-            
-        except Exception as e:
-            logger.error(f"獲取活躍訂單失敗: {e}")
-            return []
-    
-    def cancel_all_funding_offers(self, currency: str) -> bool:
-        """取消所有活躍的放貸訂單"""
-        try:
-            active_offers = self.get_active_funding_offers(currency)
-            if not active_offers:
-                logger.info("沒有需要取消的訂單")
-                return True
-            
-            cancelled_count = 0
-            for offer in active_offers:
-                if len(offer) >= 1:
-                    offer_id = offer[0]
-                    cancel_response = self._make_request(
-                        'POST', 
-                        '/v2/auth/w/funding/offer/cancel', 
-                        {'id': offer_id},
-                        authenticated=True
-                    )
-                    if cancel_response:
-                        cancelled_count += 1
-                        time.sleep(0.1)  # 避免請求過快
-            
-            logger.info(f"成功取消 {cancelled_count}/{len(active_offers)} 個訂單")
-            return cancelled_count > 0
-            
-        except Exception as e:
-            logger.error(f"取消訂單失敗: {e}")
-            return False
-    
-    def submit_funding_offer(self, currency: str, amount: Decimal, rate: Decimal, period: int) -> Optional[Dict]:
-        """提交放貸訂單"""
-        try:
-            # Bitfinex 要求利率為年化百分比 (0.01 = 1%)
-            annual_rate = float(rate * 365 * 100)
-            
-            payload = {
-                'type': 'LIMIT',
-                'symbol': f'f{currency}',
-                'amount': str(amount),
-                'rate': str(annual_rate),
-                'period': period,
-                'flags': 0
-            }
-            
-            response = self._make_request(
-                'POST', 
-                '/v2/auth/w/funding/offer/submit', 
-                payload,
-                authenticated=True
-            )
-            
-            if response and len(response) >= 7:
-                logger.info(f"提交訂單成功: {amount} {currency} @ {annual_rate:.4f}% (年化) for {period} days")
-                return response
-            else:
-                logger.warning(f"訂單提交響應異常: {response}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"提交訂單失敗: {e}")
-            return None
-    
-    def get_funding_book(self, currency: str) -> Dict:
-        """獲取資金簿數據 (用於市場分析)"""
-        try:
-            response = self._make_request('GET', f'/v2/book/f{currency}/P0', params={'len': '25'})
-            if response:
-                return {
-                    'bids': response,
-                    'timestamp': time.time()
-                }
-            return {}
-            
-        except Exception as e:
-            logger.error(f"獲取資金簿失敗: {e}")
-            return {}
 
 class SimpleDatabase:
     """精簡版數據庫管理 - 只處理 2 張核心表"""
@@ -234,7 +61,7 @@ class SimpleDatabase:
     def _test_connection(self):
         """測試數據庫連接"""
         try:
-            with psycopg2.connect(self.db_url) as conn:
+            with psycopg.connect(self.db_url) as conn:
                 with conn.cursor() as cur:
                     cur.execute('SELECT 1')
         except Exception as e:
@@ -243,7 +70,7 @@ class SimpleDatabase:
     
     def get_connection(self):
         """獲取數據庫連接"""
-        return psycopg2.connect(self.db_url)
+        return psycopg.connect(self.db_url)
     
     def initialize_tables(self):
         """初始化數據庫表結構"""
@@ -387,27 +214,79 @@ class SimpleLendingBot:
         logger.info("🚀 SimpleLendingBot 初始化開始...")
         
         # API 客戶端
-        self.api = SimpleBitfinexAPI()
+        self.api = BitfinexAPI()
         
         # 數據庫管理
         self.db = SimpleDatabase()
         self.db.initialize_tables()
         
-        # 配置參數
-        self.currency = config('LENDING_CURRENCY', default='USD')
-        self.min_amount = Decimal(config('MIN_ORDER_AMOUNT', default='50'))
+        # 基本配置參數
+        self.currency = config('LENDING_CURRENCY', default='UST')
+        self.min_amount = Decimal(config('MIN_ORDER_AMOUNT', default='150'))
         self.max_amount = Decimal(config('MAX_LOAN_AMOUNT', default='10000'))
         self.run_interval = int(config('RUN_INTERVAL_MINUTES', default='30'))
+        
+        # 放貸期限控制 (必需配置)
+        self.min_period = int(config('LENDING_MIN_PERIOD', default='2'))
+        self.max_period = int(config('LENDING_MAX_PERIOD', default='30'))
+        self.preferred_period = int(config('LENDING_PREFERRED_PERIOD', default='7'))
+        
+        # 利率邊界保護 (必需配置)
+        self.min_annual_rate = Decimal(config('MIN_ANNUAL_RATE', default='0.05'))
+        self.max_annual_rate = Decimal(config('MAX_ANNUAL_RATE', default='0.50'))
+        self.target_annual_rate = Decimal(config('TARGET_ANNUAL_RATE', default='0.12'))
+        
+        # 資金安全保護 (必需配置)
+        self.max_utilization_rate = Decimal(config('MAX_UTILIZATION_RATE', default='100'))
+        self.single_order_max_percent = Decimal(config('SINGLE_ORDER_MAX_PERCENT', default='25'))
+        
+        # 穩定性保障 (必需配置)
+        self.max_retry_attempts = int(config('MAX_RETRY_ATTEMPTS', default='3'))
+        self.retry_delay_seconds = int(config('RETRY_DELAY_SECONDS', default='5'))
+        self.order_timeout_seconds = int(config('ORDER_TIMEOUT_SECONDS', default='30'))
         
         # Telegram 配置 (可選)
         self.telegram_token = config('TELEGRAM_BOT_TOKEN', default='')
         self.telegram_chat_id = config('TELEGRAM_CHAT_ID', default='')
         
+        # 動態利率配置 (新增)
+        enable_dynamic_str = config('ENABLE_DYNAMIC_RATE', default='false').lower()
+        self.enable_dynamic_rate = enable_dynamic_str in ('true', '1', 'yes', 'on')
+        self.market_rate_buffer_percent = int(config('MARKET_RATE_BUFFER_PERCENT', default='5'))
+        self.min_rate_safety_margin = Decimal(config('MIN_RATE_SAFETY_MARGIN', default='0.02'))  # 2%
+        
+        # 初始化動態利率組件 (如果啟用)
+        if self.enable_dynamic_rate:
+            logger.info("🔥 動態階梯策略已啟用")
+            
+            # 創建簡單階梯策略配置
+            class StrategyConfig:
+                def __init__(self, buffer_pct, ladder_levels):
+                    self.competitive_buffer_percent = buffer_pct
+                    self.ladder_levels = ladder_levels
+                    self.min_rate_threshold = 0.05  # 5% 年化最低門檻
+            
+            strategy_config = StrategyConfig(self.market_rate_buffer_percent, 10)
+            # 傳入API客戶端，讓策略內部處理市場數據
+            self.ladder_strategy = SimpleLadderStrategy(strategy_config, api_client=self.api)
+        else:
+            logger.info("📊 使用固定利率策略")
+            self.ladder_strategy = None
+        
         logger.info(f"✅ 配置加載完成:")
         logger.info(f"   💰 放貸幣種: {self.currency}")
         logger.info(f"   💵 訂單範圍: {self.min_amount} - {self.max_amount}")
+        logger.info(f"   📅 放貸期限: {self.min_period}-{self.max_period}天 (首選{self.preferred_period}天)")
+        logger.info(f"   📈 利率範圍: {float(self.min_annual_rate)*100:.1f}%-{float(self.max_annual_rate)*100:.1f}% (目標{float(self.target_annual_rate)*100:.1f}%)")
+        logger.info(f"   ⚖️ 資金利用率: 最大{float(self.max_utilization_rate):.0f}% (單筆≤{float(self.single_order_max_percent):.0f}%)")
+        logger.info(f"   🔄 重試設定: 最多{self.max_retry_attempts}次，間隔{self.retry_delay_seconds}秒")
         logger.info(f"   ⏰ 運行間隔: {self.run_interval} 分鐘")
         logger.info(f"   📱 Telegram: {'已配置' if self.telegram_token else '未配置'}")
+        
+        if self.enable_dynamic_rate:
+            logger.info(f"   🔥 動態利率: 啟用 (緩衝{self.market_rate_buffer_percent}%, 安全邊際{float(self.min_rate_safety_margin)*100:.1f}%)")
+        else:
+            logger.info(f"   📊 利率策略: 固定利率")
     
     def send_telegram_notification(self, message: str):
         """發送 Telegram 通知"""
@@ -432,41 +311,148 @@ class SimpleLendingBot:
         except Exception as e:
             logger.error(f"發送 Telegram 通知失敗: {e}")
     
-    def ladder_strategy(self, available_balance: Decimal) -> List[Dict]:
-        """階梯策略 - 在多個利率水平分散資金"""
-        if available_balance < self.min_amount:
-            logger.warning(f"可用餘額 {available_balance} 低於最小訂單金額 {self.min_amount}")
+    
+    def _calculate_optimal_ladder_count(self, usable_balance: Decimal) -> int:
+        """
+        動態計算最佳階梯檔數
+        確保每筆訂單都不低於 min_amount
+        
+        Args:
+            usable_balance: 實際可用餘額 (已扣除利用率限制)
+            
+        Returns:
+            int: 最佳階梯檔數 (1-10)
+        """
+        # 理論最大檔數 (預設10檔)
+        max_levels = 10
+        
+        # 考慮單筆訂單限制
+        max_single_order = usable_balance * (self.single_order_max_percent / Decimal('100'))
+        
+        # 從最大檔數開始向下調整
+        for levels in range(max_levels, 0, -1):
+            # 平均每檔金額
+            avg_amount_per_level = usable_balance / levels
+            
+            # 檢查是否滿足最小金額要求
+            if avg_amount_per_level >= self.min_amount:
+                # 檢查是否超過單筆限制
+                if avg_amount_per_level <= max_single_order:
+                    # 完美匹配：滿足最小金額且不超過單筆限制
+                    logger.info(f"💡 動態調整階梯檔數: {levels}檔 (每檔約 {avg_amount_per_level:.2f}, 範圍: {self.min_amount}-{max_single_order})")
+                    return levels
+                else:
+                    # 超過單筆限制，但仍滿足最小金額
+                    # 檢查是否可以通過增加檔數來解決
+                    min_levels_for_single_limit = int(usable_balance / max_single_order) + 1
+                    
+                    # 檢查增加檔數後是否還能滿足最小金額
+                    if min_levels_for_single_limit <= max_levels:
+                        avg_with_more_levels = usable_balance / min_levels_for_single_limit
+                        if avg_with_more_levels >= self.min_amount:
+                            # 可以通過增加檔數解決
+                            logger.info(f"💡 基於單筆限制調整檔數: {min_levels_for_single_limit}檔 (每檔約 {avg_with_more_levels:.2f})")
+                            return min_levels_for_single_limit
+                    
+                    # 無法通過增加檔數解決，優先滿足最小金額要求
+                    logger.warning(f"⚠️  單筆限制沖突：選擇 {levels}檔 (每檔{avg_amount_per_level:.2f} > 單筆限制{max_single_order:.2f}，但滿足最小金額)")
+                    return levels
+        
+        # 如果所有檔數都不滿足，返回1檔 (全部資金一筆)
+        logger.warning(f"⚠️  無法滿足最小金額要求，使用1檔策略 (總金額: {usable_balance})")
+        return 1
+    
+    
+    def _generate_ladder_orders(self, available_balance: Decimal) -> List[Dict]:
+        """
+        使用 SimpleLadderStrategy 生成階梯訂單
+        
+        Args:
+            available_balance: 可用餘額
+            
+        Returns:
+            List[Dict]: 訂單列表
+        """
+        try:
+            if self.ladder_strategy:
+                # 計算可用餘額
+                usable_balance = available_balance * (self.max_utilization_rate / Decimal('100'))
+                
+                # 計算最佳階梯檔數
+                optimal_levels = self._calculate_optimal_ladder_count(usable_balance)
+                
+                # 使用 SimpleLadderStrategy 生成階梯利率
+                strategy_result = self.ladder_strategy.generate_ladder_rates(
+                    currency=self.currency,
+                    target_levels=optimal_levels
+                )
+                
+                if strategy_result and 'ladder_rates' in strategy_result:
+                    ladder_rates = strategy_result['ladder_rates']
+                    
+                    # 轉換為主程序期望的格式
+                    return self._convert_ladder_strategy_to_orders(available_balance, ladder_rates)
+                else:
+                    logger.warning("SimpleLadderStrategy 未返回有效階梯數據")
+                    return []
+            else:
+                # 回退到固定利率策略
+                return self._create_fixed_rate_orders(available_balance)
+                
+        except Exception as e:
+            logger.error(f"生成階梯訂單失敗: {e}")
             return []
+    
+    def _convert_ladder_strategy_to_orders(self, available_balance: Decimal, ladder_rates: List[Dict]) -> List[Dict]:
+        """
+        將 SimpleLadderStrategy 的輸出轉換為主程序期望的訂單格式
         
-        # 5階梯配置
-        ladder_count = 5
-        base_rate = Decimal('0.0001')  # 0.01% 日利率 (3.65% 年化)
-        rate_increment = Decimal('0.0001')  # 每階梯增加 0.01%
-        period_days = 2  # 2天期
-        
-        # 計算每階梯金額
-        amount_per_ladder = min(available_balance / ladder_count, self.max_amount / ladder_count)
+        Args:
+            available_balance: 可用餘額
+            ladder_rates: SimpleLadderStrategy 返回的階梯利率列表
+            
+        Returns:
+            List[Dict]: 訂單列表
+        """
+        # 計算可用餘額
+        usable_balance = available_balance * (self.max_utilization_rate / Decimal('100'))
+        max_single_order = usable_balance * (self.single_order_max_percent / Decimal('100'))
         
         orders = []
         total_amount = Decimal('0')
+        actual_period = max(self.min_period, min(self.preferred_period, self.max_period))
         
-        for i in range(ladder_count):
-            if amount_per_ladder >= self.min_amount:
-                rate = base_rate + (rate_increment * i)
-                amount = round(amount_per_ladder, 2)
+        for ladder in ladder_rates:
+            # 根據權重分配金額
+            weight = Decimal(str(ladder['weight_suggestion']))
+            amount = usable_balance * weight
+            
+            # 應用單筆訂單限制
+            amount = min(amount, max_single_order)
+            amount = round(amount, 2)  # 保留兩位小數
+            
+            if amount >= self.min_amount:
+                # 使用階梯策略的日利率
+                daily_rate = Decimal(str(ladder['daily_rate']))
                 
                 orders.append({
                     'amount': amount,
-                    'rate': rate,
-                    'period': period_days,
-                    'annual_rate_pct': float(rate * 365 * 100)  # 轉換為年化百分比
+                    'rate': daily_rate,  # 日利率
+                    'period': actual_period,
+                    'annual_rate_pct': float(daily_rate * 365 * 100),  # 轉換為年化百分比
+                    'level': ladder['level']
                 })
                 total_amount += amount
         
         logger.info(f"🎯 階梯策略生成:")
         logger.info(f"   📊 階梯數量: {len(orders)}")
-        logger.info(f"   💰 總金額: {total_amount} {self.currency}")
-        logger.info(f"   📈 利率範圍: {base_rate*365*100:.2f}% - {(base_rate + rate_increment * (ladder_count-1))*365*100:.2f}% (年化)")
+        logger.info(f"   💰 可用餘額: {available_balance} → 實用餘額: {usable_balance} (利用率≤{self.max_utilization_rate}%)")
+        logger.info(f"   💵 總分配: {total_amount} {self.currency} (單筆≤{max_single_order})")
+        if orders:
+            min_rate = min(order['annual_rate_pct'] for order in orders)
+            max_rate = max(order['annual_rate_pct'] for order in orders)
+            logger.info(f"   📈 利率範圍: {min_rate:.2f}% - {max_rate:.2f}% (年化)")
+        logger.info(f"   📅 放貸期限: {actual_period}天")
         
         return orders
     
@@ -483,54 +469,131 @@ class SimpleLendingBot:
             cancelled = self.api.cancel_all_funding_offers(self.currency)
             time.sleep(2)  # 等待取消生效
             
-            # 2. 獲取可用餘額
-            logger.info("2️⃣ 獲取可用餘額...")
-            balances = self.api.get_wallet_balances()
-            available = balances.get(self.currency, Decimal('0'))
+            # 2. 檢查所有錢包並自動轉移資金
+            logger.info("2️⃣ 檢查錢包狀態...")
+            all_wallets = self.api.get_all_wallet_balances()
+            
+            # 檢查 funding 錢包餘額
+            funding_balance = all_wallets.get('funding', {}).get(self.currency, Decimal('0'))
+            exchange_balance = all_wallets.get('exchange', {}).get(self.currency, Decimal('0'))
+            
+            logger.info(f"💰 funding 錢包: {funding_balance} {self.currency}")
+            logger.info(f"💱 exchange 錢包: {exchange_balance} {self.currency}")
+            
+            # 如果 funding 錢包資金不足但 exchange 錢包有資金，自動轉移
+            if funding_balance < self.min_amount and exchange_balance > 0:
+                transfer_amount = exchange_balance
+                logger.info(f"🔄 自動轉移 {transfer_amount} {self.currency} 從 exchange 到 funding 錢包...")
+                
+                if self.api.transfer_between_wallets(self.currency, transfer_amount, 'exchange', 'funding'):
+                    time.sleep(2)  # 等待轉帳生效
+                    # 重新獲取 funding 錢包餘額
+                    balances = self.api.get_wallet_balances()
+                    available = balances.get(self.currency, Decimal('0'))
+                    logger.info(f"✅ 轉帳成功，funding 錢包現有: {available} {self.currency}")
+                else:
+                    logger.error("❌ 轉帳失敗")
+                    available = funding_balance
+            else:
+                available = funding_balance
             
             if available <= 0:
                 logger.warning("⚠️  沒有可用餘額，跳過本次運行")
                 self._update_status(Decimal('0'), Decimal('0'), 0, 'no_balance')
                 return
             
-            logger.info(f"💰 可用餘額: {available} {self.currency}")
+            logger.info(f"💰 可用於放貸的餘額: {available} {self.currency}")
             
-            # 3. 執行階梯策略
-            logger.info("3️⃣ 執行階梯策略...")
-            orders = self.ladder_strategy(available)
+            # 3. 探測實際可用放貸金額
+            logger.info("3️⃣ 探測實際可用放貸金額...")
+            actual_available = self._probe_available_lending_amount(available)
+            logger.info(f"🔍 探測結果: 實際可用放貸金額 {actual_available} {self.currency}")
+            
+            if actual_available <= 0:
+                logger.warning("⚠️  探測發現無可用放貸金額，跳過本次運行")
+                self._update_status(available, Decimal('0'), 0, 'no_lending_balance')
+                return
+            
+            # 4. 基於實際可用金額執行階梯策略
+            logger.info("4️⃣ 執行階梯策略...")
+            orders = self._generate_ladder_orders(actual_available)
             
             if not orders:
                 logger.warning("⚠️  策略未生成訂單")
                 self._update_status(available, Decimal('0'), 0, 'no_orders')
                 return
             
-            # 4. 提交訂單
-            logger.info("4️⃣ 提交放貸訂單...")
+            # 5. 提交訂單
+            logger.info("5️⃣ 提交放貸訂單...")
             successful_orders = 0
             total_lending = Decimal('0')
+            remaining_balance = actual_available  # 使用實際可用金額
+            consecutive_failures = 0
             
             for i, order in enumerate(orders, 1):
-                logger.info(f"   提交訂單 {i}/{len(orders)}: {order['amount']} {self.currency} @ {order['annual_rate_pct']:.4f}% (年化)")
+                # 動態重新分配剩餘資金到剩餘訂單
+                remaining_orders = len(orders) - i + 1
+                if remaining_orders > 0 and remaining_balance > 0:
+                    # 重新計算每筆訂單的平均金額
+                    avg_amount_per_order = remaining_balance / remaining_orders
+                    # 使用平均金額，但不超過原訂單金額和單筆限制
+                    max_single_order = remaining_balance * (self.single_order_max_percent / Decimal('100'))
+                    adjusted_amount = min(avg_amount_per_order, order['amount'], max_single_order)
+                else:
+                    adjusted_amount = min(order['amount'], remaining_balance)
+                
+                # 如果調整後的金額小於最小金額，跳過
+                if adjusted_amount < self.min_amount:
+                    logger.info(f"   跳過訂單 {i}/{len(orders)}: 調整後金額 {adjusted_amount:.2f} 小於最小金額 {self.min_amount}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:  # 連續3次失敗則停止
+                        logger.warning("   連續失敗過多，停止提交剩餘訂單")
+                        break
+                    continue
+                
+                if adjusted_amount != order['amount']:
+                    logger.info(f"   提交訂單 {i}/{len(orders)}: {adjusted_amount:.2f} {self.currency} @ {order['annual_rate_pct']:.4f}% (年化) [動態調整: 原{order['amount']:.2f} → 新{adjusted_amount:.2f}]")
+                else:
+                    logger.info(f"   提交訂單 {i}/{len(orders)}: {adjusted_amount:.2f} {self.currency} @ {order['annual_rate_pct']:.4f}% (年化)")
                 
                 result = self.api.submit_funding_offer(
                     self.currency,
-                    order['amount'],
+                    adjusted_amount,
                     order['rate'],
                     order['period']
                 )
                 
                 if result:
                     successful_orders += 1
-                    total_lending += order['amount']
+                    total_lending += adjusted_amount
+                    remaining_balance -= adjusted_amount
+                    consecutive_failures = 0  # 重置失敗計數
                     time.sleep(1)  # 避免請求過快
+                else:
+                    consecutive_failures += 1
+                    logger.warning(f"   訂單 {i} 提交失敗，剩餘資金: {remaining_balance}")
+                    
+                    # 如果連續失敗且剩餘資金很少，停止提交
+                    if consecutive_failures >= 2 and remaining_balance < self.min_amount * 2:
+                        logger.warning("   連續失敗且剩餘資金不足，停止提交剩餘訂單")
+                        break
             
-            # 5. 更新系統狀態
-            logger.info("5️⃣ 更新系統狀態...")
+            # 6. 更新系統狀態
+            logger.info("6️⃣ 更新系統狀態...")
             self._update_status(available, total_lending, successful_orders, 'success')
             
-            # 6. 發送成功通知
+            # 7. 發送成功通知
             cycle_end = datetime.now()
             runtime = (cycle_end - cycle_start).total_seconds()
+            
+            # 計算利率範圍 
+            rate_range_text = ""
+            if orders:
+                min_rate = min(order['annual_rate_pct'] for order in orders)
+                max_rate = max(order['annual_rate_pct'] for order in orders)
+                min_daily_rate = min_rate / 365
+                max_daily_rate = max_rate / 365
+                rate_range_text = f"📊 <b>日利率區間</b>: {min_daily_rate:.4f}% - {max_daily_rate:.4f}%\n"
             
             success_message = f"""
 🤖 <b>SimpleLendingBot 運行報告</b>
@@ -540,8 +603,8 @@ class SimpleLendingBot:
 📊 <b>成功訂單</b>: {successful_orders}/{len(orders)}
 💵 <b>放貸金額</b>: {total_lending:,.2f} {self.currency}
 📈 <b>資金利用率</b>: {(total_lending/available*100):.1f}%
-
-🎯 <b>策略</b>: 5階梯放貸
+{rate_range_text}
+🎯 <b>策略</b>: 10階梯放貸
 ⚡ <b>執行時間</b>: {runtime:.1f} 秒
 ✅ <b>狀態</b>: 正常運行
 
@@ -574,6 +637,61 @@ class SimpleLendingBot:
             """.strip()
             
             self.send_telegram_notification(error_message)
+    
+    def _probe_available_lending_amount(self, wallet_balance: Decimal) -> Decimal:
+        """
+        探測實際可用的放貸金額
+        通過二分法快速找到最大可用金額
+        
+        Args:
+            wallet_balance: 錢包顯示的餘額
+            
+        Returns:
+            Decimal: 實際可用於放貸的金額
+        """
+        try:
+            # 使用固定的500 USD進行簡單測試
+            test_amount = Decimal('500')
+            actual_amount = Decimal('0')
+            
+            logger.info(f"🔍 使用固定 {test_amount} USD 進行探測測試")
+            
+            # 使用最低利率快速測試
+            test_rate = self.min_annual_rate / 365  # 轉換為日利率
+            
+            # 提交測試訂單
+            result = self.api.submit_funding_offer(
+                self.currency,
+                test_amount,
+                test_rate,
+                self.min_period
+            )
+            
+            if result:
+                logger.info(f"   ✅ {test_amount} USD 測試成功")
+                
+                # 立即取消測試訂單
+                time.sleep(1)
+                self.api.cancel_all_funding_offers(self.currency)
+                
+                # 基於500 USD測試推估總可用金額
+                # 如果500 USD測試成功，估算總可用金額約為500的8-12倍（更保守）
+                estimated_total = test_amount * 10  # 保守估計為10倍 (500 * 10 = 5000)
+                # 但不能超過錢包餘額的25%
+                max_safe_amount = wallet_balance * Decimal('0.25')
+                actual_amount = min(estimated_total, max_safe_amount)
+                logger.info(f"🎯 探測完成，基於 {test_amount} USD 測試成功，估算總可用: {actual_amount:.2f}")
+                
+            else:
+                logger.warning(f"   ❌ {test_amount} USD 測試失敗")
+                actual_amount = Decimal('0')
+            
+            return actual_amount
+            
+        except Exception as e:
+            logger.error(f"探測可用放貸金額失敗: {e}")
+            # 回退到保守估計
+            return wallet_balance * Decimal('0.3')  # 使用30%作為保守估計
     
     def _update_status(self, available: Decimal, lending: Decimal, orders: int, status: str):
         """更新系統狀態"""
@@ -723,7 +841,7 @@ class SimpleLendingBot:
 
 💰 <b>放貸幣種</b>: {self.currency}
 ⏰ <b>運行間隔</b>: {self.run_interval} 分鐘
-📊 <b>策略</b>: 5階梯放貸
+📊 <b>策略</b>: 10階梯放貸
 💵 <b>訂單範圍</b>: {self.min_amount} - {self.max_amount}
 
 🎯 <b>專注目標</b>:
