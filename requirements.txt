@@ -3,8 +3,8 @@
 # HTTP 請求和 API 調用
 requests==2.31.0
 
-# PostgreSQL 數據庫連接
-psycopg2-binary==2.9.7
+# PostgreSQL 數據庫連接 (使用 psycopg3 支持 Python 3.13)
+psycopg[binary]==3.2.3
 
 # 環境變量配置管理
 python-decouple==3.8
