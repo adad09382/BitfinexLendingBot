@@ -20,24 +20,38 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     date DATE PRIMARY KEY,
     
     -- 📊 資金概況 (用戶最關心)
-    total_balance DECIMAL(15,6) NOT NULL DEFAULT 0 COMMENT '總資金額度',
-    working_balance DECIMAL(15,6) NOT NULL DEFAULT 0 COMMENT '放貸中資金 💪',
-    idle_balance DECIMAL(15,6) GENERATED ALWAYS AS (total_balance - working_balance) STORED COMMENT '閒置資金 😴',
+    total_balance DECIMAL(15,6) NOT NULL DEFAULT 0,
+    working_balance DECIMAL(15,6) NOT NULL DEFAULT 0,
+    idle_balance DECIMAL(15,6) GENERATED ALWAYS AS (total_balance - working_balance) STORED,
     
     -- 💰 收益數據 (核心重點!)
-    daily_earnings DECIMAL(15,6) NOT NULL DEFAULT 0 COMMENT '今日收益 🎉',
-    cumulative_earnings DECIMAL(15,6) NOT NULL DEFAULT 0 COMMENT '累計總收益 💎',
-    annual_rate DECIMAL(6,4) NOT NULL DEFAULT 0 COMMENT '年化收益率 📈 (小數形式，如 0.0913 = 9.13%)',
+    daily_earnings DECIMAL(15,6) NOT NULL DEFAULT 0,
+    cumulative_earnings DECIMAL(15,6) NOT NULL DEFAULT 0,
+    annual_rate DECIMAL(6,4) NOT NULL DEFAULT 0,
     
     -- 📈 運營指標
-    utilization_rate DECIMAL(5,2) NOT NULL DEFAULT 0 COMMENT '資金利用率 (百分比，如 95.50)',
-    active_loans_count INT DEFAULT 0 COMMENT '活躍放貸數量',
-    avg_lending_rate DECIMAL(6,4) DEFAULT 0 COMMENT '平均放貸利率 (年化小數)',
+    utilization_rate DECIMAL(5,2) NOT NULL DEFAULT 0,
+    active_loans_count INT DEFAULT 0,
+    avg_lending_rate DECIMAL(6,4) DEFAULT 0,
     
     -- 🕐 元數據
-    created_at TIMESTAMP DEFAULT NOW() COMMENT '記錄創建時間',
-    updated_at TIMESTAMP DEFAULT NOW() COMMENT '記錄更新時間'
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
+
+-- 為 daily_summary 表添加註釋
+COMMENT ON TABLE daily_summary IS '每日總結表 - 用戶最關心的核心數據';
+COMMENT ON COLUMN daily_summary.total_balance IS '總資金額度';
+COMMENT ON COLUMN daily_summary.working_balance IS '放貸中資金 💪';
+COMMENT ON COLUMN daily_summary.idle_balance IS '閒置資金 😴';
+COMMENT ON COLUMN daily_summary.daily_earnings IS '今日收益 🎉';
+COMMENT ON COLUMN daily_summary.cumulative_earnings IS '累計總收益 💎';
+COMMENT ON COLUMN daily_summary.annual_rate IS '年化收益率 📈 (小數形式，如 0.0913 = 9.13%)';
+COMMENT ON COLUMN daily_summary.utilization_rate IS '資金利用率 (百分比，如 95.50)';
+COMMENT ON COLUMN daily_summary.active_loans_count IS '活躍放貸數量';
+COMMENT ON COLUMN daily_summary.avg_lending_rate IS '平均放貸利率 (年化小數)';
+COMMENT ON COLUMN daily_summary.created_at IS '記錄創建時間';
+COMMENT ON COLUMN daily_summary.updated_at IS '記錄更新時間';
 
 -- 為 daily_summary 創建索引 (查詢優化)
 CREATE INDEX IF NOT EXISTS idx_daily_summary_date ON daily_summary(date DESC);
@@ -54,16 +68,26 @@ CREATE TABLE IF NOT EXISTS current_status (
     id SERIAL PRIMARY KEY,
     
     -- 💰 實時資金狀態
-    total_available DECIMAL(15,6) NOT NULL DEFAULT 0 COMMENT '當前可用於放貸的資金',
-    total_lending DECIMAL(15,6) NOT NULL DEFAULT 0 COMMENT '當前放貸中的資金',
-    active_offers_count INT NOT NULL DEFAULT 0 COMMENT '當前掛單數量',
+    total_available DECIMAL(15,6) NOT NULL DEFAULT 0,
+    total_lending DECIMAL(15,6) NOT NULL DEFAULT 0,
+    active_offers_count INT NOT NULL DEFAULT 0,
     
     -- 🤖 系統運行狀態
-    last_update TIMESTAMP NOT NULL DEFAULT NOW() COMMENT '最後更新時間',
-    last_run_status VARCHAR(20) DEFAULT 'success' COMMENT '上次運行狀態 (success/error/no_balance/no_orders)',
-    strategy_name VARCHAR(50) DEFAULT 'ladder' COMMENT '當前使用策略',
-    system_status VARCHAR(20) DEFAULT 'active' COMMENT '系統狀態 (active/paused/error)'
+    last_update TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_run_status VARCHAR(20) DEFAULT 'success',
+    strategy_name VARCHAR(50) DEFAULT 'ladder',
+    system_status VARCHAR(20) DEFAULT 'active'
 );
+
+-- 為 current_status 表添加註釋
+COMMENT ON TABLE current_status IS '當前狀態表 - 實時系統運行狀態監控';
+COMMENT ON COLUMN current_status.total_available IS '當前可用於放貸的資金';
+COMMENT ON COLUMN current_status.total_lending IS '當前放貸中的資金';
+COMMENT ON COLUMN current_status.active_offers_count IS '當前掛單數量';
+COMMENT ON COLUMN current_status.last_update IS '最後更新時間';
+COMMENT ON COLUMN current_status.last_run_status IS '上次運行狀態 (success/error/no_balance/no_orders)';
+COMMENT ON COLUMN current_status.strategy_name IS '當前使用策略';
+COMMENT ON COLUMN current_status.system_status IS '系統狀態 (active/paused/error)';
 
 -- 插入初始狀態記錄 (確保表中有1筆記錄)
 INSERT INTO current_status (
